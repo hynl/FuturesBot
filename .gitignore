@@ -1,0 +1,15 @@
+# Python相关忽略规则
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.sqlite3
+*.log
+
+# 虚拟环境
+venv/
+.env/
+
+# IDE配置文件
+.vscode/
+.idea/

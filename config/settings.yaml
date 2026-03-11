@@ -1,0 +1,11 @@
+# 交易参数配置文件
+rsi:
+  period: 14
+  overbought: 70
+  oversold: 30
+
+atr:
+  period: 14
+
+position:
+  leverage: 10
