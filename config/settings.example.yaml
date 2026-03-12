@@ -1,0 +1,74 @@
+# FuturesBot 配置示例
+# 复制此文件为 settings.yaml，然后根据需求修改参数
+# DO NOT commit settings.yaml to git (敏感的交易参数)
+# secrets.env 也不要上传 (API密钥)
+
+trade:
+  # 交易基础资产和报价资产
+  symbol: ETHUSDT          # 显式交易对，需与 base_asset+quote_asset 一致
+  base_asset: ETH          # 基础资产（ETH, BTC 等）
+  quote_asset: USDT        # 报价资产（USDT, USDC）
+  base_notional: 300       # 首单面值（单位：报价资产）
+
+capital:
+  running_pool_usdt: 800   # 运行资金池（合约账户）
+  reserve_spot_usdt: 1700  # 极限备用金（现货账户）
+
+runtime:
+  # 运行时配置
+  testnet: true            # 是否使用币安测试网（生产改为 false）
+  kline_interval: 15m      # K线周期（1m, 5m, 15m, 1h 等）
+  ohlcv_limit: 100         # 启动时加载的历史K线数量
+  price_poll_seconds: 1.0  # 实时价格轮询间隔（秒）
+
+health:
+  # 看门狗心跳检测
+  timeout_seconds: 60      # 无数据超时阈值（秒）
+  check_seconds: 30        # 心跳检查间隔（秒）
+
+rsi:
+  # 相对强度指数 (Relative Strength Index)
+  period: 14               # RSI 计算周期
+  overbought: 70           # 超买线（不用作进场，预留）
+  oversold: 30             # 超卖线（进场触发条件）
+
+atr:
+  # 平均真实波幅 (Average True Range)
+  period: 14               # ATR 计算周期
+
+grid:
+  # 网格交易参数
+  ratios: [1.0, 1.8, 3.0, 5.0]        # 相对 ATR 的跌幅系数，决定网格层级价格
+  multipliers: [1.5, 2.25, 3.375, 5.06]  # 每层相对首单的数量倍数（1.5^n）
+
+ttp:
+  # Trailing Take Profit (追踪止盈)
+  activation_profit_pct: 1.5           # 触发 TTP 的获利百分比（%）
+  trailing_loss_pct: 0.3               # 从高点回撤多少百分比时止盈（%）
+
+position:
+  # 持仓配置
+  mode: one_way            # 持仓模式（one_way / hedge）
+  leverage: 5              # 杠杆倍数（币安UM合约支持 1-125x）
+
+safety:
+  order_value: 450         # 首补面值
+  volume_multiplier: 1.5   # 网格递增乘数
+  max_trades: 4            # 最大补仓层数
+
+# ============ 配置建议 ============
+# 
+# 【保守策略】
+#   oversold: 35
+#   ttp_activation_profit_pct: 2.0
+#   ttp_trailing_loss_pct: 0.5
+# 
+# 【激进策略】
+#   oversold: 25
+#   ttp_activation_profit_pct: 1.0
+#   ttp_trailing_loss_pct: 0.2
+#
+# 【网格层数】
+#   3层: ratios: [1.0, 2.5, 4.0], multipliers: [1.5, 2.25, 3.375]
+#   5层: ratios: [0.8, 1.5, 2.5, 3.8, 5.5], multipliers: [1.0, 1.5, 2.25, 3.375, 5.06]
+

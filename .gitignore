@@ -13,3 +13,16 @@ venv/
 # IDE配置文件
 .vscode/
 .idea/
+
+# 敏感配置文件（绝不要上传）
+config/secrets.env
+config/settings.yaml
+
+# 交易数据和状态
+metrics.jsonl
+state_backup*.json
+
+# 本地缓存
+*.jsonl
+*.db
+

@@ -1,11 +1,64 @@
 # 交易参数配置文件
+trade:
+  symbol: ETHUSDT
+  base_asset: ETH
+  quote_asset: USDT
+  base_notional: 300             # 基准首单面值 (USDT)
+
+capital:
+  running_pool_usdt: 800
+  reserve_spot_usdt: 1700
+
+runtime:
+  testnet: true
+  kline_interval: 15m
+  kline_interval_4h: 4h          # 4H趋势过滤用
+  ohlcv_limit: 100
+  ohlcv_limit_4h: 210            # 4H EMA200 需要至少 200+10 根
+  price_poll_seconds: 1.0
+
+health:
+  timeout_seconds: 60
+  check_seconds: 30
+
+# ===== 策略 V2.0 核心参数 =====
+
+trend_filter:
+  enabled: true
+  ema_period: 200                # 4H EMA 周期
+
+dynamic_sizer:
+  baseline_atr: 15               # ETH 15m 基准波动率经验值
+  min_notional: 150              # 动态首单面值下限
+  max_notional: 450              # 动态首单面值上限
+
 rsi:
   period: 14
   overbought: 70
-  oversold: 30
+  oversold: 40                   # 策略要求 RSI < 40 入场
 
 atr:
   period: 14
 
 position:
-  leverage: 10
+  mode: one_way
+  leverage: 5
+
+safety:
+  order_value: 450
+  volume_multiplier: 1.5
+  max_trades: 4
+
+grid:
+  ratios: [1.0, 1.8, 3.0, 5.0]
+  multipliers: [1.5, 2.25, 3.375, 5.06]
+
+ttp:
+  activation_profit_pct: 1.5     # 常规激活线 (72h内)
+  trailing_loss_pct: 0.3
+  time_decay_hours: 72           # 超过此时长启用时间惩罚
+  time_decay_profit_pct: 0.2     # 时间惩罚后的降低激活线
+
+t4_breach:
+  buffer_pct: 0.5                # T4击穿缓冲 (0.5%防插针)
+
