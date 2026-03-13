@@ -44,30 +44,51 @@
 - ✅ 使用指南：`HOT_RELOAD_GUIDE.md`
 - 新增文件：`utils/config_watcher.py`, `HOT_RELOAD_GUIDE.md`
 
+#### 7️⃣ **Telegram 异步告警**
+- ✅ 入场 / 网格挂单 / TTP激活 / 止盈平仓事件推送
+- ✅ HIBERNATION CRITICAL 级别立即发送
+- ✅ 看门狗假死告警
+- ✅ 异步队列 + 限流 (fire-and-forget，不阻塞策略)
+- 新增文件：`utils/telegram_bot.py`
+
+#### 8️⃣ **V2.0 策略升级 (策略审查清单全通过)**
+- ✅ 宏观趋势过滤器 (4H EMA200) — 避免逆势开仓
+- ✅ 动态首单计算器 (ATR 波动率缩放) — 高波动小仓位
+- ✅ TTP 时间衰减 (持仓超 72h 降低激活线至 0.2%)
+- ✅ T4 击穿缓冲 (0.5% 防插针误判)
+- ✅ @bookTicker WebSocket — 零 API 权重实时价格 (审查清单 #4)
+- ✅ 精度强制处理 tickSize/stepSize (审查清单 #1)
+- ✅ WS 超时检测 + Ping/Pong + 自动重连 (审查清单 #2)
+- ✅ API entryPrice 均价同步 + 本地降级 (审查清单 #3)
+- 改动文件：`strategy/eth_grid_ttp.py`, `core/websocket/binance_bookticker_ws.py`, `main.py`
+
 ---
 
 ## 🚀 当前系统架构
 
 ```
 FuturesBot/
-├── main.py                         # 主程序入口、任务调度
+├── main.py                         # 主程序入口、任务调度 (6 轨道并发)
 ├── config/
 │   ├── secrets.env                # 密钥（不上传 Git）
 │   ├── settings.yaml              # 运行参数（不上传 Git）
 │   └── settings.example.yaml      # 示例配置（可上传 Git）
 ├── core/
-│   ├── exchange.py                # 币安交易所封装
-│   ├── position_manager.py        # 持仓状态管理
+│   ├── exchange.py                # 币安交易所封装 (精度处理 + 自动重试)
+│   ├── position_manager.py        # 持仓状态管理 (4 状态机 + 磁盘持久化)
 │   └── websocket/
-│       ├── binance_ws_server.py   # K线流（自动重连）
-│       └── binance_user_server.py # 用户流（自动重连）
+│       ├── binance_ws_server.py   # K线流（自动重连 + 超时检测）
+│       ├── binance_user_server.py # 用户流（自动重连 + ListenKey 续期）
+│       └── binance_bookticker_ws.py # 实时最优买卖价 @bookTicker（零 API 权重）
 ├── strategy/
-│   └── eth_grid_ttp.py            # 网格+追踪止盈策略
+│   └── eth_grid_ttp.py            # V2.0 网格+追踪止盈策略
 ├── utils/
 │   ├── risk_control.py            # 风控模块
-│   ├── metrics.py                 # 交易指标采集
-│   └── config_watcher.py          # 配置监听 & 热更新
+│   ├── metrics.py                 # 交易指标采集 (P&L / 胜率)
+│   ├── config_watcher.py          # 配置监听 & 热更新
+│   └── telegram_bot.py            # Telegram 异步告警 (入场/止盈/HIBERNATION)
 ├── check_metrics.py               # 指标查看工具
+├── strategy.md                    # V2.0 策略文档 + 代码审查清单
 └── requirements.txt
 ```
 
@@ -166,8 +187,18 @@ ttp:
 
 ### 第2周（优先级高）
 - [x] 热配置更新（无需重启修改参数）✅ **已完成**
+- [x] Telegram 告警集成 ✅ **已完成** (`utils/telegram_bot.py`)
 - [ ] 多交易对支持（同时运行 ETH/BTC/SOL）
-- [ ] Telegram 告警集成
+
+### 第2.5周 — V2.0 策略升级 ✅ **已完成**
+- [x] 宏观趋势过滤器 (4H EMA200)
+- [x] 动态首单计算器 (波动率缩放)
+- [x] TTP 时间衰减 (72h → 降低激活线)
+- [x] T4 击穿缓冲 (0.5% 防插针)
+- [x] @bookTicker WebSocket 替代 REST 轮询 (审查清单 #4)
+- [x] 精度处理 tickSize/stepSize (审查清单 #1)
+- [x] WS 超时断流检测 + 自动重连 (审查清单 #2)
+- [x] API 均价同步替代本地公式 (审查清单 #3)
 
 ### 第3周（优先级中）
 - [ ] 可视化仪表板（Streamlit）
@@ -183,17 +214,17 @@ ttp:
 
 ## 📝 已知限制
 
-1. **当前订单未实际下单**
-   - `execute_entry()` 和 `execute_take_profit()` 中下单逻辑是注释状态
-   - 测试网可用后直接启用即可
-
-2. **单交易对支持**
+1. **单交易对支持**
    - 当前仅支持单个交易对（ETH）
    - 多交易对在规划中
 
-3. **指标采集不含未实现盈亏**
+2. **指标采集不含未实现盈亏**
    - 仅记录已成交的交易
    - 未成交的网格单不在统计内
+
+3. **测试网模式**
+   - 默认 `testnet: true`，生产环境需改为 `false`
+   - 测试网流动性有限，可能影响成交
 
 ---
 
@@ -214,5 +245,5 @@ ttp:
 
 ---
 
-**最后更新**：2026-03-12
+**最后更新**：2026-03-13
 

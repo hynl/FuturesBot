@@ -3,9 +3,11 @@ from core.exchange import BinanceExchange
 from core.position_manager import TradeState
 from core.websocket.binance_user_server import BinanceUserStream
 from core.websocket.binance_ws_server import BinanceWSServer
+from core.websocket.binance_bookticker_ws import BinanceBookTickerWS
 from strategy.eth_grid_ttp import EthGridStrategy
 from utils.metrics import TradeMetrics
 from utils.config_watcher import ConfigWatcher
+from utils.telegram_bot import TelegramBot
 import time
 import asyncio
 from loguru import logger
@@ -160,12 +162,20 @@ class TradingBot:
     def __init__(self):
         self.ex = BinanceExchange(CONFIG['api_key'], CONFIG['secret'], CONFIG['testnet'])
         self.ws = BinanceWSServer(CONFIG['symbol'], interval=CONFIG['interval'])
+        self.book_ws = BinanceBookTickerWS(CONFIG['symbol'], timeout_seconds=CONFIG['health_timeout_seconds'])
         self.user_ws = BinanceUserStream(self.ex)
         self.metrics = TradeMetrics(CONFIG['symbol'])
+
+        # Telegram 告警
+        tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        tg_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+        self.telegram = TelegramBot(tg_token, tg_chat_id)
+
         self.strategy = EthGridStrategy(
             self.ex, CONFIG,
             metrics_callback=self.metrics.record_trade,
             hibernation_callback=self._enter_hibernation_loop,
+            telegram=self.telegram,
         )
         self.config_watcher = ConfigWatcher(str(SETTINGS_FILE))
         self.config_watcher.on_config_changed(self._on_config_update)
@@ -275,24 +285,26 @@ class TradingBot:
 
     async def real_time_price_worker(self):
         """
-        轨道 2: 毫秒级实时价格监控
-        用于驱动 TTP 和网格逻辑
+        轨道 2: 毫秒级实时价格监控 (via @bookTicker WebSocket)
+        ───────────────────────────────────────────────────────
+        策略审查清单 #4: 使用 @bookTicker WS 替代 REST fetch_ticker，
+        零 API 权重、毫秒级延迟、不触发频率限制。
         """
+
+        async def on_price(price: float):
+            self.last_msg_time = time.time()
+            await self.strategy.check_grid_and_ttp(price)
+
         while not self.is_shutting_down:
             try:
-                # 生产环境建议用 WS 价格，这里先用 REST 轮询演示逻辑
-                ticker = await self.ex.client.fetch_ticker(CONFIG['symbol'])
-                curr_price = ticker['last']
-
-                # 2b. 喂狗：只要成功获取到最新价格，就刷新时间戳
-                self.last_msg_time = time.time()
-
-                await self.strategy.check_grid_and_ttp(curr_price)
-                await asyncio.sleep(CONFIG['price_poll_seconds'])
+                await self.book_ws.subscribe(on_price)
+                if not self.is_shutting_down:
+                    logger.warning("BookTicker WS 已断开，5秒后重连...")
+                    await asyncio.sleep(5)
             except Exception as e:
                 if self.is_shutting_down:
                     break
-                logger.error(f"Price Worker Error: {e}")
+                logger.error(f"BookTicker Worker Error: {e}")
                 await asyncio.sleep(5)
 
     async def init_state_and_sync(self):
@@ -337,9 +349,13 @@ class TradingBot:
             if time_since_last_msg > timeout_threshold:
                 logger.critical(f"🚨 严重警告: 超过 {time_since_last_msg:.1f} 秒未收到数据，连接可能已假死！")
 
+                # Telegram 告警
+                self.telegram.alert_watchdog(time_since_last_msg)
+
                 # ==== 自愈逻辑 (Self-Healing) ====
                 # 方案 A: 强制断开 WebSocket 让其内部机制重连
                 self.ws.stop()
+                self.book_ws.stop()
 
                 # 方案 B: 触发风控报警 (结合之前写的 RiskManager)
                 # risk_manager = RiskManager(self.ex.client)
@@ -351,30 +367,30 @@ class TradingBot:
                 # 每轮巡查间隔可配置
             await asyncio.sleep(health_check_seconds)
 
-     async def user_stream_worker(self):
-         """轨道 4: 监听账户订单更新并回调策略状态机。"""
+    async def user_stream_worker(self):
+        """轨道 4: 监听账户订单更新并回调策略状态机。"""
 
-         async def on_order_callback(order_data):
-             self.last_msg_time = time.time()
-             await self.strategy.on_order_update(order_data)
+        async def on_order_callback(order_data):
+            self.last_msg_time = time.time()
+            await self.strategy.on_order_update(order_data)
 
-         while not self.is_shutting_down:
-             try:
-                 await self.user_ws.subscribe_user_data(on_order_callback)
-                 if not self.is_shutting_down:
-                     logger.warning("User Stream 已断开，5秒后尝试重连...")
-                     await asyncio.sleep(5)
-             except Exception as e:
-                 if self.is_shutting_down:
-                     break
-                 logger.error(f"User Stream Worker Error: {e}")
-                 await asyncio.sleep(5)
+        while not self.is_shutting_down:
+            try:
+                await self.user_ws.subscribe_user_data(on_order_callback)
+                if not self.is_shutting_down:
+                    logger.warning("User Stream 已断开，5秒后尝试重连...")
+                    await asyncio.sleep(5)
+            except Exception as e:
+                if self.is_shutting_down:
+                    break
+                logger.error(f"User Stream Worker Error: {e}")
+                await asyncio.sleep(5)
 
-+    async def config_watcher_worker(self):
-+        """轨道 5: 配置文件监听，支持热更新"""
-+        await self.config_watcher.start()
+    async def config_watcher_worker(self):
+        """轨道 5: 配置文件监听，支持热更新"""
+        await self.config_watcher.start()
 
-     async def shutdown(self):
+    async def shutdown(self):
         """优雅退出：停止WS并关闭交易所连接。"""
         if self.is_shutting_down:
             return
@@ -390,6 +406,8 @@ class TradingBot:
 
         await self.user_ws.shutdown()
         self.ws.stop()
+        self.book_ws.stop()
+        await self.telegram.stop()
         try:
             await self.ex.close()
         except Exception as e:
@@ -410,6 +428,9 @@ class TradingBot:
             ema_val = await self.fetch_4h_ema200()
             self.strategy.update_trend_ema(ema_val)
             logger.info(f"📈 4H EMA200 预热完成: {ema_val}")
+
+            # 1.6 启动 Telegram 后台 worker
+            await self.telegram.start()
 
             # 2. 启动并发任务
             logger.success("🤖 交易机器人已上线，开始监听市场...")

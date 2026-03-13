@@ -18,8 +18,10 @@ runtime:
   # 运行时配置
   testnet: true            # 是否使用币安测试网（生产改为 false）
   kline_interval: 15m      # K线周期（1m, 5m, 15m, 1h 等）
+  kline_interval_4h: 4h    # 4H 趋势过滤用
   ohlcv_limit: 100         # 启动时加载的历史K线数量
-  price_poll_seconds: 1.0  # 实时价格轮询间隔（秒）
+  ohlcv_limit_4h: 210      # 4H EMA200 需要至少 200+10 根
+  price_poll_seconds: 1.0  # 实时价格轮询间隔（秒）— 现已由 @bookTicker WS 替代
 
 health:
   # 看门狗心跳检测
@@ -45,6 +47,28 @@ ttp:
   # Trailing Take Profit (追踪止盈)
   activation_profit_pct: 1.5           # 触发 TTP 的获利百分比（%）
   trailing_loss_pct: 0.3               # 从高点回撤多少百分比时止盈（%）
+  time_decay_hours: 72                 # 超过此时长启用时间惩罚
+  time_decay_profit_pct: 0.2           # 时间惩罚后降低激活线（%）
+
+# ===== 策略 V2.0 核心参数 =====
+
+trend_filter:
+  enabled: true                        # 是否启用 4H EMA200 趋势过滤
+  ema_period: 200                      # 4H EMA 周期
+
+dynamic_sizer:
+  baseline_atr: 15                     # ETH 15m 基准波动率经验值
+  min_notional: 150                    # 动态首单面值下限 (USDT)
+  max_notional: 450                    # 动态首单面值上限 (USDT)
+
+t4_breach:
+  buffer_pct: 0.5                      # T4 击穿缓冲 (0.5% 防插针)
+
+# ===== Telegram 告警 =====
+# Token/ChatID 在 config/secrets.env 中配置:
+#   TELEGRAM_BOT_TOKEN=123456:ABC-DEF
+#   TELEGRAM_CHAT_ID=987654321
+# 留空或不配置则自动禁用 Telegram 告警
 
 position:
   # 持仓配置

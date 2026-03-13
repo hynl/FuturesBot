@@ -62,3 +62,7 @@ ttp:
 t4_breach:
   buffer_pct: 0.5                # T4击穿缓冲 (0.5%防插针)
 
+# ===== Telegram 告警 =====
+# Token/ChatID 在 secrets.env 中配置
+# 留空或不配置则自动禁用 Telegram 告警
+

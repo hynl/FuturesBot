@@ -9,7 +9,7 @@ from core.position_manager import SessionState, TradeState, GridOrder
 
 class EthGridStrategy:
     def __init__(self, exchange_wrapper, config: dict, metrics_callback=None,
-                 hibernation_callback=None):
+                 hibernation_callback=None, telegram=None):
         self.ex = exchange_wrapper
         self.config = config
         self.state = SessionState()
@@ -17,6 +17,7 @@ class EthGridStrategy:
         self.lock = asyncio.Lock()
         self.metrics_callback = metrics_callback
         self.hibernation_callback = hibernation_callback  # main.py 注入的冻结回调
+        self.tg = telegram  # TelegramBot 实例 (可选)
         self._is_frozen = False  # HIBERNATION 后冻结一切策略计算
 
         # ── 指标参数 ──
@@ -186,6 +187,11 @@ class EthGridStrategy:
         self.state.save_to_disk()
         logger.success(f"✅ GRID_ACTIVE, snapshot_atr={atr:.2f}, grids={len(self.state.active_grids)}")
 
+        # Telegram 告警
+        if self.tg:
+            self.tg.alert_entry(symbol, fill_price, fill_qty, dynamic_vol, atr)
+            self.tg.alert_grid_placed(symbol, self.state.active_grids)
+
     # ================================================================
     #  State 1: GRID_ACTIVE 核心循环
     # ================================================================
@@ -220,6 +226,9 @@ class EthGridStrategy:
                     f"🔥 TTP_ARMED! profit={profit_pct:.2f}% >= {effective_activation}%, "
                     f"held={hours_held:.1f}h, avg={self.state.avg_price:.2f}"
                 )
+                # Telegram 告警
+                if self.tg:
+                    self.tg.alert_ttp_armed(self.state.symbol, profit_pct, self.state.avg_price, hours_held)
 
         # ── State 2: TTP_ARMED 追踪 ──
         elif self.state.state == TradeState.TTP_ARMED:
@@ -271,12 +280,14 @@ class EthGridStrategy:
         except Exception as e:
             logger.critical(f"🚨 [HIBERNATION Step 3/5] 撤单失败: {e}")
 
-        # ── Step 4: CRITICAL 报警 ──
+        # ── Step 4: CRITICAL 报警 (含 Telegram) ──
         logger.critical(
             f"🚨🚨🚨 [HIBERNATION Step 4/5] CRITICAL ALERT: "
             f"T4防线击穿! symbol={symbol}, avg={self.state.avg_price:.2f}, "
             f"total={self.state.total_amount:.4f} — 需要人工介入!"
         )
+        if self.tg:
+            await self.tg.alert_hibernation(symbol, self.state.avg_price, self.state.total_amount)
 
         # ── Step 5: 通知 main.py 进入死循环 ──
         logger.critical("🚨 [HIBERNATION Step 5/5] 通知主程序进入休眠死循环, 等待人工重启...")
@@ -291,6 +302,10 @@ class EthGridStrategy:
         """TTP_ARMED → HUNTING: 市价平仓 + 撤单"""
         symbol = self.state.symbol
         logger.success(f"💰 TTP止盈平仓! price={price:.2f}, avg={self.state.avg_price:.2f}, qty={self.state.total_amount:.4f}")
+
+        # Telegram 告警
+        if self.tg:
+            self.tg.alert_take_profit(self.state.symbol, price, self.state.avg_price, self.state.total_amount)
 
         # 1. 市价卖出平仓
         try:
