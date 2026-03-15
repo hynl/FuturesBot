@@ -22,7 +22,7 @@ class EthGridStrategy:
 
         # ── 指标参数 ──
         self.rsi_period = config.get('rsi_period', 14)
-        self.rsi_oversold = config.get('rsi_oversold', 40.0)
+        self.rsi_oversold = config.get('rsi_oversold', 38.0)
         self.rsi_overbought = config.get('rsi_overbought', 70.0)
         self.atr_period = config.get('atr_period', 14)
 
@@ -39,8 +39,8 @@ class EthGridStrategy:
         # ── 网格参数 ──
         self.safety_notional = config.get('safety_notional', 450.0)
         self.volume_multiplier = config.get('volume_multiplier', 1.5)
-        self.max_safety_trades = config.get('max_safety_trades', 4)
-        self.grid_ratios = config.get('grid_ratios', [1.0, 1.8, 3.0, 5.0])[:self.max_safety_trades]
+        self.max_safety_trades = config.get('max_safety_trades', 5)  # V3.0: 升至 5 层
+        self.grid_ratios = config.get('grid_ratios', [1.0, 1.8, 3.0, 5.0, 8.0])[:self.max_safety_trades]
         fallback = [round(self.volume_multiplier ** (i + 1), 6) for i in range(self.max_safety_trades)]
         self.grid_multipliers = config.get('grid_multipliers', fallback)[:self.max_safety_trades]
 
@@ -56,6 +56,10 @@ class EthGridStrategy:
         # ── 4H 趋势数据缓存 (由外部注入) ──
         self._ema200_4h: float | None = None
 
+        # ── V3.0: 多周期 ATR 缓存区 (消除 HTTP 延迟) ──
+        self.atr_1h_cache: float = 0.0
+        self.atr_1d_cache: float = 0.0
+
         logger.info(
             f"策略V2.0初始化: RSI({self.rsi_period}) <{self.rsi_oversold} | ATR({self.atr_period}) baseline={self.baseline_atr} | "
             f"趋势过滤={'ON' if self.trend_filter_enabled else 'OFF'} EMA{self.trend_ema_period} | "
@@ -70,6 +74,45 @@ class EthGridStrategy:
     def update_trend_ema(self, ema_value: float | None):
         """由 main.py 注入最新的 4H EMA200 值"""
         self._ema200_4h = ema_value
+
+    async def _update_atr_cache(self):
+        """(V3.0) 后台静默更新 ATR 缓存，避免开仓时 HTTP 阻塞"""
+        try:
+            # 并行获取，但不阻塞主线程逻辑
+            h, d = await asyncio.gather(
+                self.get_atr_snapshot('1h'),
+                self.get_atr_snapshot('1d')
+            )
+            if h > 0: self.atr_1h_cache = h
+            if d > 0: self.atr_1d_cache = d
+            logger.debug(f"ATR 缓存已刷新: 1H={h:.2f}, 1D={d:.2f}")
+        except Exception as e:
+            logger.warning(f"ATR 缓存后台刷新失败: {e}")
+
+    async def get_atr_snapshot(self, timeframe: str) -> float:
+        """(V3.0) 独立获取指定周期的 ATR 快照"""
+        try:
+            # 获取足够的K线以计算 ATR(14)
+            limit = self.atr_period + 10
+            ohlcv = await self.ex.client.fetch_ohlcv(self.state.symbol, timeframe, limit=limit)
+            if not ohlcv:
+                return 0.0
+            
+            df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
+            # 确保数据由旧到新
+            
+            # 使用 pandas_ta 扩展计算 ATR
+            df.ta.atr(length=self.atr_period, append=True)
+            col_name = f"ATRr_{self.atr_period}"
+            
+            if col_name not in df.columns:
+                return 0.0
+            
+            val = df[col_name].iloc[-1]
+            return float(val) if pd.notna(val) else 0.0
+        except Exception as e:
+            logger.error(f"获取 {timeframe} ATR 失败: {e}")
+            return 0.0
 
     # ================================================================
     #  纯函数模块 — 趋势过滤器 & 动态仓位
@@ -114,6 +157,10 @@ class EthGridStrategy:
         """每当 15m K线闭合时调用"""
         if self._is_frozen:
             return
+
+        # 启动后台更新任务 (不管当前是否交易，保持数据热度)
+        asyncio.create_task(self._update_atr_cache()) 
+
         df.ta.rsi(length=self.rsi_period, append=True)
         df.ta.atr(length=self.atr_period, append=True)
 
@@ -122,15 +169,40 @@ class EthGridStrategy:
         curr_atr = last_row[f'ATRr_{self.atr_period}']
         curr_price = last_row['close']
 
-        logger.info(f"K线闭合: price={curr_price}, RSI={curr_rsi:.2f}, ATR={curr_atr:.2f}, state={self.state.state.name}")
+        # V3.0: 动能反转 logic needs prev_rsi
+        prev_rsi = 0.0
+        if len(df) >= 2:
+            prev_rsi = df.iloc[-2][f'RSI_{self.rsi_period}']
+
+        logger.info(f"K线闭合: price={curr_price}, RSI={curr_rsi:.2f} (prev={prev_rsi:.2f}), ATR={curr_atr:.2f}, state={self.state.state.name}, armed={self.state.rsi_oversold_armed}")
 
         # State 0: HUNTING — 寻猎入场
         if self.state.state == TradeState.HUNTING:
-            # AND 逻辑: 趋势 + RSI
+            # 1. 宏观趋势过滤 Check
             if not self.check_trend_filter(curr_price):
+                # 如果趋势转坏，解除 Armed 锁定 (V3.0)
+                if self.state.rsi_oversold_armed:
+                    logger.warning(f"📉 趋势转弱 (price < EMA200), 解除 RSI Armed 锁定")
+                    self.state.rsi_oversold_armed = False
+                    self.state.save_to_disk()
                 return
-            if curr_rsi < self.rsi_oversold:
-                await self.execute_entry(curr_price, curr_atr)
+
+            # 2. V3.0 寻猎逻辑: Armed -> Fire
+            if not self.state.rsi_oversold_armed:
+                # 尚未 Armed: 检查是否超卖 (掉进深坑)
+                if curr_rsi < self.rsi_oversold:
+                    self.state.rsi_oversold_armed = True
+                    self.state.save_to_disk()
+                    logger.info(f"⚡ RSI超卖 (rsi={curr_rsi:.2f} < {self.rsi_oversold}), 进入 ARMED 预备开火态")
+                    if self.tg:
+                        await self.tg.send_msg(f"⚡ RSI 超卖 ({curr_rsi:.2f}), 策略已 ARMED, 等待反转信号...")
+            
+            else:
+                # 已 Armed: 检查是否反转 (爬出深坑)
+                # 触发条件: RSI 从下往上穿越阈值 (严格金叉: 上一根在水下，这一根出水)
+                if prev_rsi <= self.rsi_oversold < curr_rsi:
+                    logger.success(f"🔥 RSI 动能反转 (prev={prev_rsi:.2f} → curr={curr_rsi:.2f} > {self.rsi_oversold}), 触发开火!")
+                    await self.execute_entry(curr_price, curr_atr)
 
         # State 1: GRID_ACTIVE — 也在 K线闭合时检查一次
         elif self.state.state == TradeState.GRID_ACTIVE:
@@ -143,6 +215,24 @@ class EthGridStrategy:
     async def execute_entry(self, price: float, atr: float):
         """State 0 HUNTING → State 1 GRID_ACTIVE"""
         symbol = self.state.symbol
+        
+        # V3.0: 优先使用本地缓存，实现 0 延迟秒开
+        atr_1h = self.atr_1h_cache
+        atr_1d = self.atr_1d_cache
+        
+        # 紧急补救：如果缓存为空（例如刚启动就触发），通过 HTTP 强拉
+        # 这种情况极少发生，仅在 Cold Start 时作为 fallback
+        if atr_1h <= 0 or atr_1d <= 0:
+            logger.warning("⚠️ ATR 缓存未命中 (Cold Start)，紧急同步拉取...")
+            atr_1h, atr_1d = await asyncio.gather(
+                self.get_atr_snapshot('1h'),
+                self.get_atr_snapshot('1d')
+            )
+
+        # 保底处理：如果 API 彻底失败
+        if atr_1h <= 0: atr_1h = atr
+        if atr_1d <= 0: atr_1d = atr * 4.0 
+
         # 1. 动态首单
         dynamic_vol = self.calc_dynamic_base_volume(atr)
         base_qty = dynamic_vol / price
@@ -164,13 +254,50 @@ class EthGridStrategy:
         self.state.total_amount = fill_qty
         self.state.entry_timestamp = time.time()
         self.state.snapshot_atr = atr
+        self.state.snapshot_atr_1h = atr_1h
+        self.state.snapshot_atr_1d = atr_1d
         self.state.dynamic_base_volume = dynamic_vol
         self.state.state = TradeState.ENTRY_SUBMITTING
 
-        # 4. 网格限价挂单 (使用 Snapshot_ATR)
-        for i, ratio in enumerate(self.grid_ratios):
-            grid_price = fill_price - (ratio * atr)
-            grid_qty = fill_qty * self.grid_multipliers[i]
+        # 4. 网格限价挂单 (V3.0 5层防御矩阵)
+        # L1: -1.5 * ATR_1H
+        # L2: -3.0 * ATR_1H
+        # L3: -5.0 * ATR_1H
+        # L4: -3.0 * ATR_1D
+        # L5: -5.5 * ATR_1D
+        
+        grid_prices = []
+        # 计算原始价格
+        p1 = fill_price - 1.5 * atr_1h
+        p2 = fill_price - 3.0 * atr_1h
+        p3 = fill_price - 5.0 * atr_1h
+
+        # 优化: 使用 min() 函数钳位，彻底消除 ATR_1D < ATR_1H 导致的网格倒挂
+        # 强制 L4 至少比 L3 低一个 1H ATR (作为最小安全间距)
+        min_gap = 1.0 * atr_1h
+
+        raw_p4 = fill_price - 3.0 * atr_1d
+        p4 = min(raw_p4, p3 - min_gap)
+
+        raw_p5 = fill_price - 5.5 * atr_1d
+        p5 = min(raw_p5, p4 - min_gap)
+
+        if p4 != raw_p4 or p5 != raw_p5:
+             logger.warning(f"⚠️ 网格结构已自动钳位修正: ATR_1H={atr_1h:.2f}, ATR_1D={atr_1d:.2f}")
+
+        grid_prices = [p1, p2, p3, p4, p5]
+
+        for i in range(self.max_safety_trades):
+            if i >= len(grid_prices): break
+            
+            raw_price = grid_prices[i]
+            raw_qty = fill_qty * self.grid_multipliers[i]
+
+            # 修复 Bug 1: 精度过滤器缺失 (Filter Failure)
+            # 必须显式调用交易所精度格式化工具，消除小数点溢出
+            # 同时确保 SessionState 存储的 GridOrder 价格与实际挂单完全一致 (所见即所得)
+            grid_price = float(self.ex.price_to_precision(symbol, raw_price))
+            grid_qty = float(self.ex.amount_to_precision(symbol, raw_qty))
 
             try:
                 grid_order = await self.ex.create_limit_order(symbol, 'buy', grid_qty, grid_price)
@@ -181,8 +308,9 @@ class EthGridStrategy:
 
             grid_item = GridOrder(level=i + 1, price=grid_price, amount=grid_qty, order_id=order_id)
             self.state.active_grids.append(grid_item)
-            logger.info(f"📍 T{i+1}: price={grid_price:.2f}, qty={grid_qty:.4f}, id={order_id}")
+            logger.info(f"📍 T{i+1}: price={grid_price} (-{(fill_price-grid_price):.2f}), qty={grid_qty}, id={order_id}")
 
+        self.state.rsi_oversold_armed = False  # V3.0: 开火后解除武装
         self.state.state = TradeState.GRID_ACTIVE
         self.state.save_to_disk()
         logger.success(f"✅ GRID_ACTIVE, snapshot_atr={atr:.2f}, grids={len(self.state.active_grids)}")
@@ -201,12 +329,13 @@ class EthGridStrategy:
         if self._is_frozen:
             return
 
-        # ── 条件 C: T4 击穿 (带 0.5% 缓冲) ──
+        # ── 条件 C: 最后一道防线击穿 (带 0.5% 缓冲) ──
         if self.state.active_grids:
-            t4_price = self.state.active_grids[-1].price
-            t4_breach_line = t4_price * (1 - self.t4_buffer_pct / 100.0)
-            if curr_price < t4_breach_line:
-                logger.critical(f"🚨 T4击穿! price={curr_price:.2f} < T4={t4_price:.2f} * (1-{self.t4_buffer_pct}%) = {t4_breach_line:.2f}")
+            last_grid = self.state.active_grids[-1]
+            bottom_price = last_grid.price
+            breach_line = bottom_price * (1 - self.t4_buffer_pct / 100.0)
+            if curr_price < breach_line:
+                logger.critical(f"🚨 防线击穿! price={curr_price:.2f} < Bottom={bottom_price:.2f} * (1-{self.t4_buffer_pct}%) = {breach_line:.2f}")
                 await self.trigger_hibernation()
                 return
 
@@ -283,11 +412,11 @@ class EthGridStrategy:
         # ── Step 4: CRITICAL 报警 (含 Telegram) ──
         logger.critical(
             f"🚨🚨🚨 [HIBERNATION Step 4/5] CRITICAL ALERT: "
-            f"T4防线击穿! symbol={symbol}, avg={self.state.avg_price:.2f}, "
+            f"防线击穿! symbol={symbol}, avg={self.state.avg_price:.2f}, "
             f"total={self.state.total_amount:.4f} — 需要人工介入!"
         )
         if self.tg:
-            await self.tg.alert_hibernation(symbol, self.state.avg_price, self.state.total_amount)
+            await self.tg.alert_hibernation(self.state.symbol, self.state.avg_price, self.state.total_amount)
 
         # ── Step 5: 通知 main.py 进入死循环 ──
         logger.critical("🚨 [HIBERNATION Step 5/5] 通知主程序进入休眠死循环, 等待人工重启...")
@@ -330,16 +459,22 @@ class EthGridStrategy:
     async def on_order_update(self, order_data):
         """User Stream 订单推送回调"""
         async with self.lock:
-            status = order_data['X']
-            if status != 'FILLED':
+            # 修复 Bug 2: 部分成交盲区 (Partial Fill Blindspot)
+            # 原代码只处理 FILLED，导致 PARTIALLY_FILLED 被忽略，持仓数据甚至 avg_price 失真
+            # 必须检查 'l' (last executed quantity) > 0 即视为有效成交
+            last_filled_qty = float(order_data.get('l', 0.0))
+            if last_filled_qty <= 0:
                 return
 
+            status = order_data['X']
             side = order_data['S']
-            price = float(order_data['L'])
-            qty = float(order_data['l'])
+            price = float(order_data['L'])  # Last executed price
+            # qty 变量复用为本次成交量
+            qty = last_filled_qty
+            
             timestamp = order_data.get('T', 0) / 1000.0
 
-            logger.success(f"✅ 成交: {side} {qty} @ {price}")
+            logger.info(f"⚡ 订单更新: {status} {side} {qty} @ {price}")
             if self.metrics_callback:
                 self.metrics_callback(side=side, price=price, qty=qty, timestamp=timestamp)
 
@@ -353,9 +488,11 @@ class EthGridStrategy:
                 # 降级: 仅在 API 失败时用本地公式
                 if side == 'BUY':
                     new_total = self.state.total_amount + qty
-                    self.state.avg_price = (
-                        (self.state.avg_price * self.state.total_amount) + (price * qty)
-                    ) / new_total
+                    # 避免除以零
+                    if new_total > 0:
+                        self.state.avg_price = (
+                            (self.state.avg_price * self.state.total_amount) + (price * qty)
+                        ) / new_total
 
             # 更新总持仓
             if side == 'BUY':
@@ -364,10 +501,24 @@ class EthGridStrategy:
                 self.state.total_amount = max(0.0, self.state.total_amount - qty)
 
             # 标记对应网格单为已成交
+            # 优先使用 Order ID 匹配
+            current_order_id = str(order_data.get('i', ''))
+            
             for g in self.state.active_grids:
-                if not g.filled and abs(g.price - price) / g.price < 0.005:
-                    g.filled = True
-                    logger.info(f"📍 T{g.level} 已成交")
+                is_match = False
+                if current_order_id and g.order_id == current_order_id:
+                    is_match = True
+                # Fallback: 价格匹配 (旧逻辑)
+                elif not g.filled and abs(g.price - price) / g.price < 0.005:
+                    is_match = True
+
+                if is_match:
+                    # 只有当状态完全变为 FILLED 时，才标记该层为已完成
+                    if status == 'FILLED':
+                        g.filled = True
+                        logger.info(f"📍 T{g.level} 已完全成交")
+                    else:
+                        logger.info(f"📍 T{g.level} 部分成交: {qty}")
                     break
 
             self.state.save_to_disk()

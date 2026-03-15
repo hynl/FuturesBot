@@ -429,6 +429,11 @@ class TradingBot:
             self.strategy.update_trend_ema(ema_val)
             logger.info(f"📈 4H EMA200 预热完成: {ema_val}")
 
+            # 1.5.1 预热 ATR 缓存 (Cold Start Patch)
+            # 确保策略启动时 ATR 缓存已就绪，避免首单 HTTP 阻塞
+            await self.strategy._update_atr_cache()
+            logger.info("❄️ ATR 缓存预热完成 (Cold Start Patch Applied)")
+
             # 1.6 启动 Telegram 后台 worker
             await self.telegram.start()
 
